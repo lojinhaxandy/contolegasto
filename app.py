@@ -9,8 +9,8 @@ from telegram.constants import ParseMode
 from telegram.ext import Dispatcher, CommandHandler
 
 # ----------------- Config -----------------
-TELEGRAM_TOKEN = os.getenv("7735147007:AAEN-_lLmBCRIgu4y2PwTWD4qNclDFRgPxY")            # token do bot Telegram
-MP_ACCESS_TOKEN = os.getenv("APP_USR-1661690156955161-061015-1277fc50c082df9755ad4a4f043449c3-1294489094")          # Access Token do Mercado Pago (token de integração)
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")            # token do bot Telegram
+MP_ACCESS_TOKEN = os.getenv("MP_ACCESS_TOKEN")          # Access Token do Mercado Pago (token de integração)
 KEEP_MONTHS = int(os.getenv("KEEP_MONTHS", "6"))        # quantos meses manter (padrão 6)
 ADMIN_CHAT_ID = os.getenv("8084023622")             # opcional: seu chat_id para alertas
 
