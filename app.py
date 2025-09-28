@@ -1,30 +1,50 @@
-# app.py
 import os
+import json
 import sqlite3
 from datetime import datetime
-from flask import Flask, request, jsonify
+from queue import Queue
+
 import requests
+from flask import Flask, request, jsonify
+
 from telegram import Bot, Update
-from telegram.constants import ParseMode
 from telegram.ext import Dispatcher, CommandHandler
 
-# ----------------- Config -----------------
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")            # token do bot Telegram
-MP_ACCESS_TOKEN = os.getenv("MP_ACCESS_TOKEN")          # Access Token do Mercado Pago (token de integração)
-KEEP_MONTHS = int(os.getenv("KEEP_MONTHS", "6"))        # quantos meses manter (padrão 6)
-ADMIN_CHAT_ID = os.getenv("8084023622")             # opcional: seu chat_id para alertas
+# =========================
+# ======= CONFIG ==========
+# =========================
+TELEGRAM_TOKEN   = os.getenv("TELEGRAM_TOKEN", "").strip()
+MP_ACCESS_TOKEN  = os.getenv("MP_ACCESS_TOKEN", "").strip()
+ADMIN_CHAT_ID    = os.getenv("8084023622", "").strip()  # opcional
+KEEP_MONTHS      = int(os.getenv("KEEP_MONTHS", "6"))
+DB_PATH          = os.getenv("DB_PATH", "data.db")
 
-# DB path (sqlite)
-DB_PATH = os.getenv("DB_PATH", "data.db")
+if not TELEGRAM_TOKEN:
+    raise RuntimeError("Falta TELEGRAM_TOKEN no ambiente.")
+if not MP_ACCESS_TOKEN:
+    # Pode rodar sem MP_ACCESS_TOKEN, mas o webhook do MP não funcionará
+    # Vamos apenas logar um aviso:
+    print("[AVISO] MP_ACCESS_TOKEN ausente. /mp_webhook não conseguirá buscar dados.")
 
-# Init
+# =========================
+# ======= APP/TELEGRAM ====
+# =========================
 app = Flask(__name__)
-bot = Bot(token=TELEGRAM_TOKEN)
-dp = Dispatcher(bot, None, workers=0, use_context=True)
 
-# ----------------- DB helpers -----------------
-def init_db():
+bot = Bot(token=TELEGRAM_TOKEN)
+update_queue = Queue()
+dispatcher = Dispatcher(bot=bot, update_queue=update_queue, workers=0, use_context=True)
+
+# =========================
+# ======= DB ==============
+# =========================
+def get_conn():
     conn = sqlite3.connect(DB_PATH)
+    conn.execute("PRAGMA journal_mode=WAL")
+    return conn
+
+def init_db():
+    conn = get_conn()
     c = conn.cursor()
     c.execute("""
     CREATE TABLE IF NOT EXISTS payments (
@@ -34,7 +54,7 @@ def init_db():
         amount REAL,
         status TEXT,
         payer_email TEXT,
-        raw JSON
+        raw TEXT
     )""")
     c.execute("""
     CREATE TABLE IF NOT EXISTS expenses (
@@ -51,92 +71,104 @@ def init_db():
     conn.commit()
     conn.close()
 
-def insert_payment(mp_id, date, amount, status, payer_email, raw):
-    conn = sqlite3.connect(DB_PATH)
+def insert_payment(mp_id, date, amount, status, payer_email, raw_as_text):
+    conn = get_conn()
     c = conn.cursor()
     try:
-        c.execute("INSERT INTO payments (mp_id,date,amount,status,payer_email,raw) VALUES (?,?,?,?,?,?)",
-                  (str(mp_id), date, amount, status, payer_email, raw))
+        c.execute("""
+            INSERT INTO payments (mp_id, date, amount, status, payer_email, raw)
+            VALUES (?,?,?,?,?,?)
+        """, (str(mp_id), date, float(amount or 0), status or "", payer_email or "", raw_as_text or ""))
         conn.commit()
-        inserted = True
+        ok = True
     except sqlite3.IntegrityError:
-        inserted = False
+        ok = False  # já existe
     conn.close()
-    return inserted
+    return ok
 
 def insert_expense(date, amount, description):
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_conn()
     c = conn.cursor()
-    c.execute("INSERT INTO expenses (date,amount,description) VALUES (?,?,?)",
-              (date, amount, description))
+    c.execute("INSERT INTO expenses (date, amount, description) VALUES (?,?,?)",
+              (date, float(amount), description))
     conn.commit()
     conn.close()
 
-def sum_payments_for_month(year, month):
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
+def month_range(year, month):
     start = f"{year:04d}-{month:02d}-01"
-    # naive end: next month
     if month == 12:
         end = f"{year+1:04d}-01-01"
     else:
         end = f"{year:04d}-{month+1:02d}-01"
+    return start, end
+
+def sum_payments_for_month(year, month):
+    start, end = month_range(year, month)
+    conn = get_conn()
+    c = conn.cursor()
     c.execute("SELECT SUM(amount) FROM payments WHERE status='approved' AND date >= ? AND date < ?", (start, end))
-    res = c.fetchone()[0] or 0.0
+    total = c.fetchone()[0] or 0.0
     conn.close()
-    return res
+    return float(total)
 
 def sum_expenses_for_month(year, month):
-    conn = sqlite3.connect(DB_PATH)
+    start, end = month_range(year, month)
+    conn = get_conn()
     c = conn.cursor()
-    start = f"{year:04d}-{month:02d}-01"
-    if month == 12:
-        end = f"{year+1:04d}-01-01"
-    else:
-        end = f"{year:04d}-{month+1:02d}-01"
     c.execute("SELECT SUM(amount) FROM expenses WHERE date >= ? AND date < ?", (start, end))
-    res = c.fetchone()[0] or 0.0
+    total = c.fetchone()[0] or 0.0
     conn.close()
-    return res
+    return float(total)
 
 def cleanup_old_months(keep_months=6):
-    # remove payments and expenses older than keep_months
-    cutoff = datetime.utcnow().replace(day=1)
-    # subtract months
-    ym = cutoff.year * 12 + cutoff.month - keep_months
+    """Remove dados anteriores ao primeiro dia do mês (UTC) menos keep_months."""
+    now = datetime.utcnow().replace(day=1)
+    ym = now.year * 12 + now.month - keep_months
     cutoff_year = (ym - 1) // 12
     cutoff_month = (ym - 1) % 12 + 1
     cutoff_str = f"{cutoff_year:04d}-{cutoff_month:02d}-01"
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_conn()
     c = conn.cursor()
     c.execute("DELETE FROM payments WHERE date < ?", (cutoff_str,))
     c.execute("DELETE FROM expenses WHERE date < ?", (cutoff_str,))
     conn.commit()
     conn.close()
 
-# ----------------- Mercado Pago helper -----------------
+# =========================
+# ======= MERCADO PAGO ====
+# =========================
 MP_BASE = "https://api.mercadopago.com"
 
 def fetch_mp_payment(payment_id):
+    if not MP_ACCESS_TOKEN:
+        return None
     url = f"{MP_BASE}/v1/payments/{payment_id}"
     headers = {"Authorization": f"Bearer {MP_ACCESS_TOKEN}"}
-    r = requests.get(url, headers=headers, timeout=15)
-    if r.status_code == 200:
-        return r.json()
-    else:
-        app.logger.warning("MP fetch failed %s %s", r.status_code, r.text)
+    try:
+        r = requests.get(url, headers=headers, timeout=20)
+        if r.status_code == 200:
+            return r.json()
+        else:
+            print(f"[MP] Falha {r.status_code}: {r.text}")
+            return None
+    except Exception as e:
+        print(f"[MP] Erro fetch: {e}")
         return None
 
-# ----------------- Telegram handlers -----------------
-def start(update, context):
+# =========================
+# ======= HANDLERS TG =====
+# =========================
+def cmd_start(update, context):
     update.message.reply_text(
-        "Bot de finanças MP.\nComandos:\n"
-        "/addexpense <valor> <descr> - registra gasto\n"
-        "/profit <mm> <aaaa> - mostra lucro do mês\n"
-        "/balance <mm> <aaaa> - mostra vendas, gastos do mês\n        /lastmonths <n> - mostra lucros últimos n meses (padrão 6)\n"
+        "🤖 Bot de Controle de Vendas/Despesas (Mercado Pago)\n\n"
+        "Comandos:\n"
+        "• /addexpense <valor> <descrição> — registrar gasto\n"
+        "• /profit [mm aaaa] — lucro do mês (padrão: mês atual)\n"
+        "• /balance [mm aaaa] — vendas/gastos/lucro do mês\n"
+        "• /lastmonths [n] — resumo dos últimos n meses (padrão: 6)\n"
     )
 
-def addexpense(update, context):
+def cmd_addexpense(update, context):
     try:
         args = context.args
         if len(args) < 2:
@@ -146,130 +178,160 @@ def addexpense(update, context):
         description = " ".join(args[1:])
         date = datetime.utcnow().strftime("%Y-%m-%d")
         insert_expense(date, amount, description)
-        update.message.reply_text(f"Despesa salva: R$ {amount:.2f} — {description}")
+        update.message.reply_text(f"✅ Despesa salva: R$ {amount:.2f} — {description}")
     except Exception as e:
-        update.message.reply_text("Erro ao salvar despesa: " + str(e))
+        update.message.reply_text(f"❌ Erro ao salvar despesa: {e}")
 
-def profit(update, context):
+def _parse_month_year(args):
+    if len(args) >= 2:
+        month = int(args[0])
+        year = int(args[1])
+    else:
+        now = datetime.utcnow()
+        month = now.month
+        year = now.year
+    if not (1 <= month <= 12):
+        raise ValueError("Mês inválido. Use 1-12.")
+    return month, year
+
+def cmd_profit(update, context):
     try:
-        args = context.args
-        if len(args) >= 2:
-            month = int(args[0])
-            year = int(args[1])
-        else:
-            now = datetime.utcnow()
-            month = now.month
-            year = now.year
+        month, year = _parse_month_year(context.args)
         vendas = sum_payments_for_month(year, month)
         gastos = sum_expenses_for_month(year, month)
-        lucro = vendas - gastos
-        msg = f"Resumo {month:02d}/{year}\nVendas aprovadas: R$ {vendas:.2f}\nGastos: R$ {gastos:.2f}\nLucro: R$ {lucro:.2f}"
+        lucro  = vendas - gastos
+        msg = (
+            f"📊 Resumo {month:02d}/{year}\n"
+            f"• Vendas aprovadas: R$ {vendas:.2f}\n"
+            f"• Gastos:           R$ {gastos:.2f}\n"
+            f"• 💰 Lucro:          R$ {lucro:.2f}"
+        )
         update.message.reply_text(msg)
     except Exception as e:
-        update.message.reply_text("Erro: " + str(e))
+        update.message.reply_text(f"❌ Erro: {e}")
 
-def balance(update, context):
-    profit(update, context)
+def cmd_balance(update, context):
+    # mesmo cálculo do profit, apenas alias
+    cmd_profit(update, context)
 
-def lastmonths(update, context):
+def cmd_lastmonths(update, context):
     try:
         n = int(context.args[0]) if context.args else KEEP_MONTHS
+        if n < 1:
+            n = KEEP_MONTHS
         now = datetime.utcnow()
-        lines = []
         y = now.year
         m = now.month
-        for i in range(n):
+        lines = []
+        for _ in range(n):
             vendas = sum_payments_for_month(y, m)
             gastos = sum_expenses_for_month(y, m)
-            lucro = vendas - gastos
-            lines.append(f"{m:02d}/{y} — V: R${vendas:.2f} G: R${gastos:.2f} L: R${lucro:.2f}")
-            # decrement month
+            lucro  = vendas - gastos
+            lines.append(f"{m:02d}/{y} — V: R${vendas:.2f}  G: R${gastos:.2f}  L: R${lucro:.2f}")
             m -= 1
             if m == 0:
                 m = 12
                 y -= 1
-        update.message.reply_text("\n".join(lines))
+        update.message.reply_text("📆 Últimos meses:\n" + "\n".join(lines))
     except Exception as e:
-        update.message.reply_text("Erro: " + str(e))
+        update.message.reply_text(f"❌ Erro: {e}")
 
-# Register handlers
-dp.add_handler(CommandHandler("start", start))
-dp.add_handler(CommandHandler("addexpense", addexpense))
-dp.add_handler(CommandHandler("profit", profit))
-dp.add_handler(CommandHandler("balance", balance))
-dp.add_handler(CommandHandler("lastmonths", lastmonths))
+# registra handlers
+dispatcher.add_handler(CommandHandler("start",      cmd_start))
+dispatcher.add_handler(CommandHandler("addexpense", cmd_addexpense))
+dispatcher.add_handler(CommandHandler("profit",     cmd_profit))
+dispatcher.add_handler(CommandHandler("balance",    cmd_balance))
+dispatcher.add_handler(CommandHandler("lastmonths", cmd_lastmonths))
 
-# ----------------- Flask routes -----------------
+# =========================
+# ======= FLASK ROUTES ====
+# =========================
+@app.route("/", methods=["GET"])
+def index():
+    return "OK - Bot de finanças Mercado Pago"
+
 @app.route("/telegram_webhook", methods=["POST"])
 def telegram_webhook():
-    # Used if you want Telegram -> webhook to us. We won't rely on it for payments, only for bot commands.
-    update = Update.de_json(request.get_json(force=True), bot)
-    dp.process_update(update)
-    return "OK"
+    """Recebe updates do Telegram e processa via Dispatcher v13."""
+    try:
+        data = request.get_json(force=True)
+        update = Update.de_json(data, bot)
+        dispatcher.process_update(update)
+        return "OK"
+    except Exception as e:
+        print(f"[TG] Erro no webhook: {e}")
+        return "ERR", 500
+
+@app.route("/set_webhook", methods=["POST", "GET"])
+def set_webhook():
+    """Utilitário: define o webhook do Telegram apontando pra /telegram_webhook.
+    Chame com ?secret=SEU_TOKEN_PESSOAL para evitar abuso.
+    """
+    secret = request.args.get("secret", "")
+    # simples proteção
+    if not ADMIN_CHAT_ID or secret != (ADMIN_CHAT_ID[-6:] if len(ADMIN_CHAT_ID) >= 6 else "ok"):
+        return "unauthorized", 401
+    url = request.url_root.rstrip("/") + "/telegram_webhook"
+    ok = bot.set_webhook(url=url, allowed_updates=["message"], max_connections=40)
+    return jsonify({"set_webhook": ok, "url": url})
 
 @app.route("/mp_webhook", methods=["POST"])
 def mp_webhook():
     """
-    Mercado Pago sends a notification with JSON body like:
-    {"action":"payment.created","data":{"id":123456},"topic":"payment"}
-    Or older format: {"type":"payment","id":"123"}
-    We will support both: get id, fetch payment details, store.
+    Mercado Pago envia notificações com o id do pagamento.
+    Buscamos o pagamento via API e salvamos (idempotente).
     """
     try:
         payload = request.get_json(force=True, silent=True) or {}
-        # Work with different formats
         mp_id = None
-        if "data" in payload and isinstance(payload["data"], dict) and payload["data"].get("id"):
+
+        # Formatos comuns
+        if isinstance(payload.get("data"), dict) and payload["data"].get("id"):
             mp_id = payload["data"]["id"]
         elif payload.get("id"):
-            mp_id = payload.get("id")
-        elif payload.get("action") and payload.get("data", {}).get("id"):
-            mp_id = payload["data"]["id"]
-        else:
-            # fallback: check query params
+            mp_id = payload["id"]
+        # fallback querystring
+        if not mp_id:
             mp_id = request.args.get("id")
 
         if not mp_id:
-            app.logger.warning("mp_webhook: no id in payload: %s", payload)
-            return jsonify({"ok": False, "reason": "no id"}), 400
+            return jsonify({"ok": False, "reason": "no_id"}), 400
 
         payment = fetch_mp_payment(mp_id)
         if not payment:
             return jsonify({"ok": False, "reason": "fetch_failed"}), 500
 
-        amount = 0.0
-        # amount can be in 'transaction_amount' or 'transaction_amount' inside array depending on API
         amount = float(payment.get("transaction_amount") or payment.get("transaction_amount_paid") or 0.0)
-        status = payment.get("status")  # e.g., approved, refused, pending
-        payer_email = None
-        if payment.get("payer"):
-            payer_email = payment["payer"].get("email")
+        status = payment.get("status") or ""
+        payer_email = ""
+        if isinstance(payment.get("payer"), dict):
+            payer_email = payment["payer"].get("email") or ""
 
-        date = payment.get("date_created", datetime.utcnow().isoformat())[:10]  # YYYY-MM-DD
-        inserted = insert_payment(mp_id, date, amount, status, payer_email, str(payment))
+        # datas da API costumam vir ISO; guardamos só YYYY-MM-DD
+        date = (payment.get("date_created") or datetime.utcnow().isoformat())[:10]
+
+        inserted = insert_payment(mp_id, date, amount, status, payer_email, json.dumps(payment)[:200000])
         if inserted:
-            app.logger.info("Inserted payment %s amount %s status %s", mp_id, amount, status)
-            # optional: notify admin
+            print(f"[MP] Inserido {mp_id} R${amount:.2f} status={status}")
             if ADMIN_CHAT_ID:
                 try:
-                    bot.send_message(int(ADMIN_CHAT_ID),
-                                     f"Novo pagamento: R$ {amount:.2f} — status: {status} — {date}")
+                    bot.send_message(chat_id=int(ADMIN_CHAT_ID),
+                                     text=f"🧾 Pagamento MP #{mp_id}\nR$ {amount:.2f} — {status} — {date}")
                 except Exception as e:
-                    app.logger.warning("notify failed %s", e)
+                    print(f"[TG] Falha ao notificar ADMIN: {e}")
         else:
-            app.logger.info("Payment %s already exists", mp_id)
+            print(f"[MP] Já existia {mp_id}")
 
-        # after storing, do cleanup
         cleanup_old_months(KEEP_MONTHS)
         return jsonify({"ok": True})
     except Exception as e:
-        app.logger.exception("mp_webhook error")
+        print(f"[MP] Erro webhook: {e}")
         return jsonify({"ok": False, "error": str(e)}), 500
 
-@app.route("/", methods=["GET"])
-def index():
-    return "Bot de finanças Mercado Pago - OK"
-
+# =========================
+# ======= MAIN ============
+# =========================
 if __name__ == "__main__":
     init_db()
+    # Em local dev você pode rodar: python app.py
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", 5000)))
