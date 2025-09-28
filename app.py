@@ -582,24 +582,33 @@ def _process_text_and_reply(chat_id, text, source="manual_text", reply=True, cha
 
 def handle_text(update, context):
     try:
-        text = (update.message.text or "").strip()
-        if not text:
-            send_menu(update.effective_chat.id)
+        # Blindagem: só processa se houver mensagem de texto (chat privado/grupo)
+        em = update.effective_message
+        if not em or not getattr(em, "text", None):
+            if update.effective_chat:
+                send_menu(update.effective_chat.id)
             return
 
+        text = em.text.strip()
+
+        # Botões
         if handle_buttons(update, context, text):
             return
 
-        # tenta registrar depósitos
+        # Tenta registrar depósitos a partir do texto
         if _process_text_and_reply(update.effective_chat.id, text, source="manual_text", reply=True):
             return
 
-        # se não era depósito nem botão, mostra menu
+        # Se não era depósito nem botão, mostra menu
         send_menu(update.effective_chat.id)
 
     except Exception as e:
         log.exception("Erro ao processar texto")
-        update.message.reply_text(f"❌ Erro: {e}", reply_markup=main_menu())
+        try:
+            if update.effective_chat:
+                bot.send_message(update.effective_chat.id, f"❌ Erro: {e}", reply_markup=main_menu())
+        except:
+            pass
 
 def handle_channel_post(update, context):
     try:
@@ -609,7 +618,7 @@ def handle_channel_post(update, context):
         text = (post.text or post.caption or "").strip()
         # processa silenciosamente e avisa ADMIN
         _process_text_and_reply(
-            chat_id=post.chat_id,  # não vamos responder no canal (a não ser que seja admin)
+            chat_id=post.chat_id,  # não respondemos no canal; apenas registra e notifica ADMIN (se configurado)
             text=text,
             source="channel",
             reply=False,
@@ -631,14 +640,14 @@ dispatcher.add_handler(CommandHandler("exportcsv",   cmd_exportcsv))
 dispatcher.add_handler(CommandHandler("list",        cmd_list))
 dispatcher.add_handler(CommandHandler("undo",        cmd_undo))
 
-# mensagens de chat privado/grupo
-dispatcher.add_handler(MessageHandler(Filters.text & ~Filters.command, handle_text))
-# posts de CANAL (ponte)
-try:
-    dispatcher.add_handler(MessageHandler(Filters.text & Filters.chat_type.channel, handle_channel_post))
-except Exception:
-    # fallback para algumas versões
-    pass
+# mensagens de chat privado/grupo (texto, não comando, e NÃO canal)
+dispatcher.add_handler(
+    MessageHandler(Filters.text & ~Filters.command & ~Filters.chat_type.channel, handle_text)
+)
+# posts de CANAL (texto em canal)
+dispatcher.add_handler(
+    MessageHandler(Filters.text & Filters.chat_type.channel, handle_channel_post)
+)
 
 # =========================
 # ====== ROTAS FLASK ======
