@@ -635,7 +635,7 @@ dispatcher.add_handler(CommandHandler("undo",        cmd_undo))
 dispatcher.add_handler(MessageHandler(Filters.text & ~Filters.command, handle_text))
 # posts de CANAL (ponte)
 try:
-    dispatcher.add_handler(MessageHandler(Filters.channel, handle_channel_post))
+    dispatcher.add_handler(MessageHandler(Filters.text & Filters.chat_type.channel, handle_channel_post))
 except Exception:
     # fallback para algumas versões
     pass
