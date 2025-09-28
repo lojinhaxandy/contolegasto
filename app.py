@@ -10,34 +10,23 @@ from flask import Flask, request, jsonify
 from telegram import Bot, Update
 from telegram.ext import Dispatcher, CommandHandler
 
-# =========================
-# ======= CONFIG ==========
-# =========================
 TELEGRAM_TOKEN   = os.getenv("TELEGRAM_TOKEN", "").strip()
 MP_ACCESS_TOKEN  = os.getenv("MP_ACCESS_TOKEN", "").strip()
-ADMIN_CHAT_ID    = os.getenv("8084023622", "").strip()  # opcional
+ADMIN_CHAT_ID    = os.getenv("ADMIN_CHAT_ID", "").strip()
 KEEP_MONTHS      = int(os.getenv("KEEP_MONTHS", "6"))
 DB_PATH          = os.getenv("DB_PATH", "data.db")
 
 if not TELEGRAM_TOKEN:
     raise RuntimeError("Falta TELEGRAM_TOKEN no ambiente.")
 if not MP_ACCESS_TOKEN:
-    # Pode rodar sem MP_ACCESS_TOKEN, mas o webhook do MP não funcionará
-    # Vamos apenas logar um aviso:
     print("[AVISO] MP_ACCESS_TOKEN ausente. /mp_webhook não conseguirá buscar dados.")
 
-# =========================
-# ======= APP/TELEGRAM ====
-# =========================
 app = Flask(__name__)
 
 bot = Bot(token=TELEGRAM_TOKEN)
 update_queue = Queue()
 dispatcher = Dispatcher(bot=bot, update_queue=update_queue, workers=0, use_context=True)
 
-# =========================
-# ======= DB ==============
-# =========================
 def get_conn():
     conn = sqlite3.connect(DB_PATH)
     conn.execute("PRAGMA journal_mode=WAL")
@@ -82,7 +71,7 @@ def insert_payment(mp_id, date, amount, status, payer_email, raw_as_text):
         conn.commit()
         ok = True
     except sqlite3.IntegrityError:
-        ok = False  # já existe
+        ok = False
     conn.close()
     return ok
 
@@ -121,7 +110,6 @@ def sum_expenses_for_month(year, month):
     return float(total)
 
 def cleanup_old_months(keep_months=6):
-    """Remove dados anteriores ao primeiro dia do mês (UTC) menos keep_months."""
     now = datetime.utcnow().replace(day=1)
     ym = now.year * 12 + now.month - keep_months
     cutoff_year = (ym - 1) // 12
@@ -134,9 +122,6 @@ def cleanup_old_months(keep_months=6):
     conn.commit()
     conn.close()
 
-# =========================
-# ======= MERCADO PAGO ====
-# =========================
 MP_BASE = "https://api.mercadopago.com"
 
 def fetch_mp_payment(payment_id):
@@ -155,9 +140,6 @@ def fetch_mp_payment(payment_id):
         print(f"[MP] Erro fetch: {e}")
         return None
 
-# =========================
-# ======= HANDLERS TG =====
-# =========================
 def cmd_start(update, context):
     update.message.reply_text(
         "🤖 Bot de Controle de Vendas/Despesas (Mercado Pago)\n\n"
@@ -211,7 +193,6 @@ def cmd_profit(update, context):
         update.message.reply_text(f"❌ Erro: {e}")
 
 def cmd_balance(update, context):
-    # mesmo cálculo do profit, apenas alias
     cmd_profit(update, context)
 
 def cmd_lastmonths(update, context):
@@ -236,23 +217,20 @@ def cmd_lastmonths(update, context):
     except Exception as e:
         update.message.reply_text(f"❌ Erro: {e}")
 
-# registra handlers
 dispatcher.add_handler(CommandHandler("start",      cmd_start))
 dispatcher.add_handler(CommandHandler("addexpense", cmd_addexpense))
 dispatcher.add_handler(CommandHandler("profit",     cmd_profit))
 dispatcher.add_handler(CommandHandler("balance",    cmd_balance))
 dispatcher.add_handler(CommandHandler("lastmonths", cmd_lastmonths))
 
-# =========================
-# ======= FLASK ROUTES ====
-# =========================
+app = Flask(__name__)
+
 @app.route("/", methods=["GET"])
 def index():
     return "OK - Bot de finanças Mercado Pago"
 
 @app.route("/telegram_webhook", methods=["POST"])
 def telegram_webhook():
-    """Recebe updates do Telegram e processa via Dispatcher v13."""
     try:
         data = request.get_json(force=True)
         update = Update.de_json(data, bot)
@@ -264,11 +242,7 @@ def telegram_webhook():
 
 @app.route("/set_webhook", methods=["POST", "GET"])
 def set_webhook():
-    """Utilitário: define o webhook do Telegram apontando pra /telegram_webhook.
-    Chame com ?secret=SEU_TOKEN_PESSOAL para evitar abuso.
-    """
     secret = request.args.get("secret", "")
-    # simples proteção
     if not ADMIN_CHAT_ID or secret != (ADMIN_CHAT_ID[-6:] if len(ADMIN_CHAT_ID) >= 6 else "ok"):
         return "unauthorized", 401
     url = request.url_root.rstrip("/") + "/telegram_webhook"
@@ -277,23 +251,15 @@ def set_webhook():
 
 @app.route("/mp_webhook", methods=["POST"])
 def mp_webhook():
-    """
-    Mercado Pago envia notificações com o id do pagamento.
-    Buscamos o pagamento via API e salvamos (idempotente).
-    """
     try:
         payload = request.get_json(force=True, silent=True) or {}
         mp_id = None
-
-        # Formatos comuns
         if isinstance(payload.get("data"), dict) and payload["data"].get("id"):
             mp_id = payload["data"]["id"]
         elif payload.get("id"):
             mp_id = payload["id"]
-        # fallback querystring
         if not mp_id:
             mp_id = request.args.get("id")
-
         if not mp_id:
             return jsonify({"ok": False, "reason": "no_id"}), 400
 
@@ -307,7 +273,6 @@ def mp_webhook():
         if isinstance(payment.get("payer"), dict):
             payer_email = payment["payer"].get("email") or ""
 
-        # datas da API costumam vir ISO; guardamos só YYYY-MM-DD
         date = (payment.get("date_created") or datetime.utcnow().isoformat())[:10]
 
         inserted = insert_payment(mp_id, date, amount, status, payer_email, json.dumps(payment)[:200000])
@@ -328,10 +293,6 @@ def mp_webhook():
         print(f"[MP] Erro webhook: {e}")
         return jsonify({"ok": False, "error": str(e)}), 500
 
-# =========================
-# ======= MAIN ============
-# =========================
 if __name__ == "__main__":
     init_db()
-    # Em local dev você pode rodar: python app.py
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", 5000)))
