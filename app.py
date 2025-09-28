@@ -8,7 +8,7 @@ from queue import Queue
 
 from flask import Flask, request, jsonify
 
-from telegram import Bot, Update
+from telegram import Bot, Update, ReplyKeyboardMarkup, KeyboardButton
 from telegram.ext import Dispatcher, CommandHandler, MessageHandler, Filters
 
 # =========================
@@ -52,13 +52,13 @@ def init_db():
     c.execute("""
     CREATE TABLE IF NOT EXISTS payments (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
-        date TEXT,            -- YYYY-MM-DD
-        amount REAL,          -- valor do depósito (sem bônus)
-        raw TEXT,             -- texto bruto salvo
-        created_at TEXT,      -- data/hora do texto (string original)
-        source TEXT,          -- 'manual_text'
-        user_code TEXT,       -- ex: 1039020435
-        referrer_code TEXT    -- se houver 'Indicado por'
+        date TEXT,
+        amount REAL,
+        raw TEXT,
+        created_at TEXT,
+        source TEXT,
+        user_code TEXT,
+        referrer_code TEXT
     )""")
     c.execute("""
     CREATE TABLE IF NOT EXISTS expenses (
@@ -138,10 +138,8 @@ USER_RE        = re.compile(r"User:\s*([0-9]+)")
 VALOR_RE       = re.compile(r"Valor:\s*R\$\s*([0-9]+[.,][0-9]{2})", re.IGNORECASE)
 DATA_RE        = re.compile(r"Data:\s*([0-9]{2}/[0-9]{2}/[0-9]{4})(?:\s+([0-9]{2}:[0-9]{2}:[0-9]{2}))?")
 REF_RE         = re.compile(r"Indicado por:\s*([0-9]+)", re.IGNORECASE)
-# bônus é ignorado de propósito
 
 def to_decimal(s):
-    # "1.234,56" ou "8,00" -> float
     s = s.strip()
     if "," in s and "." in s:
         s = s.replace(".", "").replace(",", ".")
@@ -158,10 +156,6 @@ def parse_date(dmy, hms):
         return today, hms or ""
 
 def extract_deposits_from_text(text):
-    """
-    Devolve lista [{amount, date_ymd, created_at, user_code, referrer_code, raw}]
-    Aceita múltiplos depósitos num mesmo texto.
-    """
     if not text:
         return []
     text = text.replace("\u00A0", " ").strip()
@@ -226,39 +220,65 @@ def extract_deposits_from_text(text):
     return deposits
 
 # =========================
+# ======= MENU ============
+# =========================
+BTN_PROFIT     = "📊 Lucro do mês"
+BTN_LASTMONTHS = "📆 Últimos meses"
+BTN_ADD_EXP    = "➕ Registrar gasto"
+BTN_HELP       = "ℹ️ Ajuda"
+
+def main_menu():
+    return ReplyKeyboardMarkup(
+        [
+            [KeyboardButton(BTN_PROFIT), KeyboardButton(BTN_LASTMONTHS)],
+            [KeyboardButton(BTN_ADD_EXP), KeyboardButton(BTN_HELP)],
+        ],
+        resize_keyboard=True
+    )
+
+def send_menu(chat_id, intro_text=None):
+    text = intro_text or (
+        "🤖 *Controle de Vendas & Despesas*\n"
+        "Encaminhe mensagens de *Novo DEPÓSITO* para registrar vendas (bônus é ignorado).\n\n"
+        "Escolha uma opção:"
+    )
+    bot.send_message(
+        chat_id=chat_id,
+        text=text,
+        parse_mode="Markdown",
+        reply_markup=main_menu()
+    )
+
+# =========================
 # ===== COMANDOS TG =======
 # =========================
 def cmd_start(update, context):
-    update.message.reply_text(
-        "🤖 Bot de Controle de Vendas/Despesas\n\n"
-        "Encaminhe mensagens de \"Novo DEPÓSITO\" para eu registrar as receitas (ignoro bônus).\n\n"
-        "Comandos:\n"
-        "• /addexpense <valor> <descrição> — registrar gasto\n"
-        "• /profit [mm aaaa] — lucro do mês\n"
-        "• /lastmonths [n] — últimos n meses\n"
-        "• /test — verifica se o bot está online\n"
-        "• /me — mostra seu chat_id\n"
-    )
+    send_menu(update.effective_chat.id, "👋 *Bem-vindo!*")
 
 def cmd_test(update, context):
-    update.message.reply_text("✅ Bot online e webhook OK.")
+    update.message.reply_text("✅ Bot online e webhook OK.", reply_markup=main_menu())
 
 def cmd_me(update, context):
-    update.message.reply_text(f"Seu chat_id: {update.effective_chat.id}")
+    update.message.reply_text(f"Seu chat_id: `{update.effective_chat.id}`", parse_mode="Markdown", reply_markup=main_menu())
 
 def cmd_addexpense(update, context):
     try:
         args = context.args
         if len(args) < 2:
-            update.message.reply_text("Uso: /addexpense 12.50 Descrição do gasto")
+            update.message.reply_text(
+                "Uso: `/addexpense 12.50 Descrição do gasto`\n"
+                "_Ex.:_ `/addexpense 8.90 Taxa da plataforma`",
+                parse_mode="Markdown",
+                reply_markup=main_menu()
+            )
             return
         amount = float(args[0].replace(",", "."))
         desc = " ".join(args[1:])
         date = datetime.utcnow().strftime("%Y-%m-%d")
         insert_expense(date, amount, desc)
-        update.message.reply_text(f"✅ Despesa salva: R$ {amount:.2f} — {desc}")
+        update.message.reply_text(f"✅ *Despesa salva*\n• Valor: R$ {amount:.2f}\n• Desc.: {desc}", parse_mode="Markdown", reply_markup=main_menu())
     except Exception as e:
-        update.message.reply_text(f"❌ Erro: {e}")
+        update.message.reply_text(f"❌ Erro: {e}", reply_markup=main_menu())
 
 def _parse_month_year(args):
     if len(args) >= 2:
@@ -268,20 +288,23 @@ def _parse_month_year(args):
     if not (1 <= m <= 12): raise ValueError("Mês inválido 1-12")
     return m, y
 
+def _profit_text(m, y):
+    vendas = sum_payments_for_month(y, m)
+    gastos = sum_expenses_for_month(y, m)
+    lucro  = vendas - gastos
+    return (
+        f"📊 *Resumo {m:02d}/{y}*\n"
+        f"• Vendas: R$ {vendas:.2f}\n"
+        f"• Gastos: R$ {gastos:.2f}\n"
+        f"• 💰 Lucro: *R$ {lucro:.2f}*"
+    )
+
 def cmd_profit(update, context):
     try:
         m, y = _parse_month_year(context.args)
-        vendas = sum_payments_for_month(y, m)
-        gastos = sum_expenses_for_month(y, m)
-        lucro = vendas - gastos
-        update.message.reply_text(
-            f"📊 {m:02d}/{y}\n"
-            f"Vendas: R$ {vendas:.2f}\n"
-            f"Gastos: R$ {gastos:.2f}\n"
-            f"💰 Lucro: R$ {lucro:.2f}"
-        )
+        update.message.reply_text(_profit_text(m, y), parse_mode="Markdown", reply_markup=main_menu())
     except Exception as e:
-        update.message.reply_text(f"❌ Erro: {e}")
+        update.message.reply_text(f"❌ Erro: {e}", reply_markup=main_menu())
 
 def cmd_lastmonths(update, context):
     try:
@@ -293,12 +316,48 @@ def cmd_lastmonths(update, context):
             v = sum_payments_for_month(y, m)
             g = sum_expenses_for_month(y, m)
             l = v - g
-            lines.append(f"{m:02d}/{y} — V: R${v:.2f} G: R${g:.2f} L: R${l:.2f}")
+            lines.append(f"{m:02d}/{y} — *V*: R${v:.2f}  *G*: R${g:.2f}  *L*: R${l:.2f}")
             m -= 1
             if m == 0: m = 12; y -= 1
-        update.message.reply_text("📆 Últimos meses:\n" + "\n".join(lines))
+        update.message.reply_text("📆 *Últimos meses*\n" + "\n".join(lines), parse_mode="Markdown", reply_markup=main_menu())
     except Exception as e:
-        update.message.reply_text(f"❌ Erro: {e}")
+        update.message.reply_text(f"❌ Erro: {e}", reply_markup=main_menu())
+
+# =========================
+# ===== ATALHOS BOTÕES ====
+# =========================
+def handle_buttons(update, context, text):
+    text = text.strip()
+    if text == BTN_PROFIT:
+        now = datetime.utcnow(); m = now.month; y = now.year
+        update.message.reply_text(_profit_text(m, y), parse_mode="Markdown", reply_markup=main_menu())
+        return True
+    if text == BTN_LASTMONTHS:
+        # usa default KEEP_MONTHS
+        now = datetime.utcnow(); y = now.year; m = now.month
+        lines = []
+        for _ in range(KEEP_MONTHS):
+            v = sum_payments_for_month(y, m)
+            g = sum_expenses_for_month(y, m)
+            l = v - g
+            lines.append(f"{m:02d}/{y} — *V*: R${v:.2f}  *G*: R${g:.2f}  *L*: R${l:.2f}")
+            m -= 1
+            if m == 0: m = 12; y -= 1
+        update.message.reply_text("📆 *Últimos meses*\n" + "\n".join(lines), parse_mode="Markdown", reply_markup=main_menu())
+        return True
+    if text == BTN_ADD_EXP:
+        update.message.reply_text(
+            "➕ *Registrar gasto*\n"
+            "Envie no formato: `/addexpense 12.50 Descrição`\n"
+            "_Ex.:_ `/addexpense 8.90 Taxa da plataforma`",
+            parse_mode="Markdown",
+            reply_markup=main_menu()
+        )
+        return True
+    if text == BTN_HELP:
+        cmd_start(update, context)
+        return True
+    return False
 
 # =========================
 # ===== HANDLER TEXTO =====
@@ -307,32 +366,48 @@ def handle_text(update, context):
     try:
         text = (update.message.text or "").strip()
         if not text:
+            send_menu(update.effective_chat.id)
             return
+
+        # 1) Se for um botão do menu, atende e retorna
+        if handle_buttons(update, context, text):
+            return
+
+        # 2) Tenta extrair depósitos do texto
         deposits = extract_deposits_from_text(text)
-        if not deposits:
-            return  # não responde se não detectar depósito
+        if deposits:
+            total = 0.0
+            for d in deposits:
+                insert_payment_manual(
+                    date_yyyy_mm_dd=d["date_ymd"],
+                    amount=d["amount"],
+                    created_at=d["created_at"],
+                    user_code=d["user_code"],
+                    referrer_code=d["referrer_code"],
+                    raw_text=d["raw"]
+                )
+                total += d["amount"]
 
-        total = 0.0
-        for d in deposits:
-            insert_payment_manual(
-                date_yyyy_mm_dd=d["date_ymd"],
-                amount=d["amount"],
-                created_at=d["created_at"],
-                user_code=d["user_code"],
-                referrer_code=d["referrer_code"],
-                raw_text=d["raw"]
+            update.message.reply_text(
+                f"✅ *Depósito(s) registrado(s)*\n"
+                f"• Quantidade: {len(deposits)}\n"
+                f"• Soma: *R$ {total:.2f}*\n\n"
+                f"Use /profit para ver o lucro do mês.",
+                parse_mode="Markdown",
+                reply_markup=main_menu()
             )
-            total += d["amount"]
+            return
 
-        update.message.reply_text(
-            f"✅ Registrei {len(deposits)} depósito(s). Soma: R$ {total:.2f}\n"
-            f"(Ignorando bônus; use /profit para ver o lucro do mês)"
-        )
+        # 3) Caso não seja depósito nem botão, apenas mostre o menu
+        send_menu(update.effective_chat.id)
+
     except Exception as e:
         log.exception("Erro ao processar texto")
-        update.message.reply_text(f"❌ Erro: {e}")
+        update.message.reply_text(f"❌ Erro: {e}", reply_markup=main_menu())
 
-# registra comandos e handler de texto
+# =========================
+# ===== REGISTRAR HND =====
+# =========================
 dispatcher.add_handler(CommandHandler("start",      cmd_start))
 dispatcher.add_handler(CommandHandler("test",       cmd_test))
 dispatcher.add_handler(CommandHandler("me",         cmd_me))
@@ -346,7 +421,7 @@ dispatcher.add_handler(MessageHandler(Filters.text & ~Filters.command, handle_te
 # =========================
 @app.route("/", methods=["GET"])
 def index():
-    return "OK - Bot de finanças manual (depósitos por texto)"
+    return "OK - Bot de finanças manual (depósitos por texto) + menu"
 
 @app.route("/telegram_webhook", methods=["POST"])
 def telegram_webhook():
@@ -420,6 +495,5 @@ def db_init():
 # ======= MAIN ============
 # =========================
 if __name__ == "__main__":
-    # já foi chamado no import, mas repetimos por segurança em dev
     init_db()
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", 5000)))
